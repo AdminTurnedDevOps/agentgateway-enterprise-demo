@@ -74,7 +74,7 @@ metadata:
     app: agentgateway
 type: Opaque
 stringData:
-  Authorization: $CLAUDE_API_KEY
+  Authorization: $ANTHROPIC_API_KEY
 EOF
 ```
 
@@ -155,7 +155,7 @@ curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-
 }' | jq
 ```
 
-## MCP Server Secure Connectivity (JWT)
+## Gateway Secure Connectivity (JWT)
 
 1. Create a traffic policy that realize on a JWT key for authentication
 ```
@@ -183,7 +183,7 @@ EOF
 
 2. Try curling the Gateway
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
   "messages": [
     {
       "role": "system",
@@ -197,19 +197,10 @@ curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-
 }' | jq
 ```
 
-You should see a failure in the agentgateway Pod logs
+You should see a failure in the `curl` output and the agentgateway Pod logs
+
 ```
 kubectl logs deploy/agentgateway -n gloo-system
-```
-
-3. Open MCP Inspector:
-```
-
-```
-
-4. Add the following for the **Bearer Token** for authentication:
-```
-eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNvbG8tcHVibGljLWtleS0wMDEifQ.eyJpc3MiOiJzb2xvLmlvIiwib3JnIjoic29sby5pbyIsInN1YiI6ImJvYiIsInRlYW0iOiJvcHMiLCJleHAiOjIwNzQyNzQ5NTQsImxsbXMiOnsibWlzdHJhbGFpIjpbIm1pc3RyYWwtbGFyZ2UtbGF0ZXN0Il19fQ.GF_uyLpZSTT1DIvJeO_eish1WDjMaS4BQSifGQhqPRLjzu3nXtPkaBRjceAmJi9gKZYAzkT25MIrT42ZIe3bHilrd1yqittTPWrrM4sWDDeldnGsfU07DWJHyboNapYR-KZGImSmOYshJlzm1tT_Bjt3-RK3OBzYi90_wl0dyAl9D7wwDCzOD4MRGFpoMrws_OgVrcZQKcadvIsH8figPwN4mK1U_1mxuL08RWTu92xBcezEO4CdBaFTUbkYN66Y2vKSTyPCxg3fLtg1mvlzU1-Wgm2xZIiPiarQHt6Uq7v9ftgzwdUBQM1AYLvUVhCN6XkkR9OU3p0OXiqEDjAxcg
 ```
 
 ## MCP Server Security (Streamable HTTP Server)
@@ -242,6 +233,8 @@ kubectl apply -f- <<EOF
 apiVersion: gateway.kgateway.dev/v1alpha1
 kind: Backend
 metadata:
+  labels:
+    app: agentgateway
   name: github-mcp-backend
   namespace: gloo-system
 spec:
@@ -293,14 +286,6 @@ spec:
             type: PathPrefix
             value: /mcp-github
       filters:
-        - type: CORS
-          cors:
-            allowHeaders:
-              - "*"
-            allowMethods:
-              - "*"
-            allowOrigins:
-              - "http://localhost:8080"
         - type: RequestHeaderModifier
           requestHeaderModifier:
             set:
@@ -320,7 +305,7 @@ npx modelcontextprotocol/inspector#0.16.2
 
 Witin the MCP Inspector options, add the following:
 - Transport Type: Select Streamable HTTP.
-- URL: Enter the agentgateway public IP address, port, and the `/mcp-github` path.
+- URL: Enter the agentgateway public IP address, port, and the `/mcp-github` path (e.g - http://34.74.143.144:8080/mcp-github)
 - Click Connect.
 
 ### Creating Your GitHub Personal Access Token
@@ -367,7 +352,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      gateway.networking.k8s.io/gateway-class-name: agentgateway
+      gateway.networking.k8s.io/gateway-class-name: agentgateway-enterprise
   podMetricsEndpoints:
   - port: metrics
     path: /metrics
@@ -389,7 +374,7 @@ kubectl --namespace monitoring port-forward svc/kube-prometheus-grafana 3000:80
 To log into the Grafana UI:
 
 1. Username: admin
-2. Password: prom-operator
+2. Password: `kubectl get secret --namespace monitoring kube-prometheus-grafana -o jsonpath="{.data.admin-password}" | base64 --decode ; echo`
 
 4. Generate some LLM traffic
 ```
@@ -494,7 +479,50 @@ spec:
 EOF
 ```
 
+5. Update the Gateway with the Gloo Parameters
+```
+kubectl apply -f- <<EOF
+kind: Gateway
+apiVersion: gateway.networking.k8s.io/v1
+metadata:
+  name: agentgateway
+  namespace: gloo-system
+  labels:
+    app: agentgateway
+spec:
+  gatewayClassName: agentgateway-enterprise
+  infrastructure:
+    parametersRef:
+      name: tracing
+      group: gloo.solo.io
+      kind: GlooGatewayParameters
+  listeners:
+  - protocol: HTTP
+    port: 8080
+    name: http
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+```
+
 ### Checking Traces
+
+1. Generate traffic
+```
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a skilled cloud-native network engineer."
+    },
+    {
+      "role": "user",
+      "content": "Write me a paragraph containing the best way to think about Istio Ambient Mesh"
+    }
+  ]
+}' | jq
+```
 
 To check the traces:
 
