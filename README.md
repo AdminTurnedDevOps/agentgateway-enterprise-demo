@@ -382,7 +382,7 @@ kubectl logs deploy/agentgateway -n gloo-system
 3. Look at the logs for the OTel tracing collector and you'll be able to see the trace ID
 ```
 kubectl logs deploy/opentelemetry-collector-traces -n telemetry
-
+```
 
 ## Bonus: Rate Limiting
 
