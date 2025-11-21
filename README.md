@@ -155,7 +155,7 @@ curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-
 }' | jq
 ```
 
-## MCP Server Security Connectivity
+## MCP Server Secure Connectivity (JWT)
 
 1. Create a traffic policy that realize on a JWT key for authentication
 ```
@@ -211,6 +211,132 @@ kubectl logs deploy/agentgateway -n gloo-system
 ```
 eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNvbG8tcHVibGljLWtleS0wMDEifQ.eyJpc3MiOiJzb2xvLmlvIiwib3JnIjoic29sby5pbyIsInN1YiI6ImJvYiIsInRlYW0iOiJvcHMiLCJleHAiOjIwNzQyNzQ5NTQsImxsbXMiOnsibWlzdHJhbGFpIjpbIm1pc3RyYWwtbGFyZ2UtbGF0ZXN0Il19fQ.GF_uyLpZSTT1DIvJeO_eish1WDjMaS4BQSifGQhqPRLjzu3nXtPkaBRjceAmJi9gKZYAzkT25MIrT42ZIe3bHilrd1yqittTPWrrM4sWDDeldnGsfU07DWJHyboNapYR-KZGImSmOYshJlzm1tT_Bjt3-RK3OBzYi90_wl0dyAl9D7wwDCzOD4MRGFpoMrws_OgVrcZQKcadvIsH8figPwN4mK1U_1mxuL08RWTu92xBcezEO4CdBaFTUbkYN66Y2vKSTyPCxg3fLtg1mvlzU1-Wgm2xZIiPiarQHt6Uq7v9ftgzwdUBQM1AYLvUVhCN6XkkR9OU3p0OXiqEDjAxcg
 ```
+
+## MCP Server Security (Streamable HTTP Server)
+
+The config below works very much like a package/library import in application code.
+
+When you apply this `MCPServer` resource to your Kubernetes cluster via kagent:
+
+1. kagent (the Kubernetes agent) sees the MCPServer resource
+2. It automatically creates a deployment that runs the GitHub MCP Server Docker container
+3. Docker pulls the latest version of `ghcr.io/github/github-mcp-server` from GitHub Container Registry
+4. The MCP server starts running in a Pod and becomes available via the stdio transport
+
+kagent handles the "package resolution" and deployment automatically. You just declare what MCP server you want (like declaring a dependency in `package.json` or `requirements.txt`), and kagent takes care of fetching, installing, and running it in your cluster.
+
+This is the power of the declarative approach. You specify what you want (the GitHub MCP Server), and kagent figures out how to get it running.
+
+**Note:** The GitHub MCP Server requires a Personal Access Token (PAT) for authentication. You'll need to create a Kubernetes secret with your GitHub PAT before deploying.
+
+Don't specify port configurations since stdio transport doesn't use HTTP
+
+1. Create the github pat token environment variable:
+```
+export GITHUB_PERSONAL_ACCESS_TOKEN=your_github_pat_here
+```
+
+2. Create the Backend so Gloo Gateway knows that it is routing to a remote MCP Server
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: Backend
+metadata:
+  name: github-mcp-backend
+  namespace: gloo-system
+spec:
+  type: MCP
+  mcp:
+    targets:
+    - name: mcp-target
+      static:
+        host: api.githubcopilot.com
+        port: 443
+        path: /mcp/
+EOF
+```
+
+3. Create a Policy for the Backend that you created in step two. This policy uses the well-known system CA certs to validated that the MCP Server has a TLS certificate
+
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: github-mcp-backend-tls
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - name: github-mcp-backend
+      kind: Backend
+      group: gateway.kgateway.dev
+  validation:
+    hostname: api.githubcopilot.com
+    wellKnownCACertificates: System
+EOF
+```
+
+4. Set up a route off of your agentgateway Gateway to hit the GitHub MCP server.
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-github
+  namespace: gloo-system
+spec:
+  parentRefs:
+  - name: agentgateway
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp-github
+      filters:
+        - type: CORS
+          cors:
+            allowHeaders:
+              - "*"
+            allowMethods:
+              - "*"
+            allowOrigins:
+              - "http://localhost:8080"
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: Authorization
+                value: "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      backendRefs:
+      - name: github-mcp-backend
+        group: gateway.kgateway.dev
+        kind: Backend
+EOF
+```
+
+5. Open MCP Inspector
+```
+npx modelcontextprotocol/inspector#0.16.2
+```
+
+Witin the MCP Inspector options, add the following:
+- Transport Type: Select Streamable HTTP.
+- URL: Enter the agentgateway public IP address, port, and the `/mcp-github` path.
+- Click Connect.
+
+### Creating Your GitHub Personal Access Token
+
+To use the GitHub MCP Server, you need a Personal Access Token with appropriate permissions:
+
+1. Go to GitHub Settings → Developer settings → Personal access tokens → Tokens (classic)
+2. Click "Generate new token (classic)"
+3. Give it a descriptive name like "kagent-mcp-server"
+4. Select the following scopes at minimum:
+   - `repo` - Full control of private repositories
+   - `read:org` - Read org and team membership
+   - `read:packages` - Download packages from GitHub Package Registry
+5. Click "Generate token" and copy the token immediately (you won't be able to see it again)
+
+For GitHub Enterprise Server, you'll also need to set the `GITHUB_HOST` environment variable in the MCPServer spec.
 
 ## Agentgateway Metrics
 
