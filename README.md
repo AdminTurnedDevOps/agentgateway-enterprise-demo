@@ -155,11 +155,191 @@ curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-
 }' | jq
 ```
 
+## Rate Limiting
+
+1. Create env variable for Anthropic key
+
+```
+export ANTHROPIC_API_KEY=
+```
+
+2. Create a secret to store the Claude API key
+```
+kubectl apply -f- <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anthropic-secret
+  namespace: kgateway-system
+  labels:
+    app: agentgateway
+type: Opaque
+stringData:
+  Authorization: $ANTHROPIC_API_KEY
+EOF
+```
+
+3. Create a Gateway for Anthropic
+
+A `Gateway` resource is used to trigger kgateway to deploy agentgateway data plane Pods
+
+The Agentgateway data plane Pod is the Pod that gets created when a Gateway object is created in a Kubernetes environment where Agentgateway is deployed as the Gateway API implementation.
+```
+kubectl apply -f- <<EOF
+kind: Gateway
+apiVersion: gateway.networking.k8s.io/v1
+metadata:
+  name: agentgateway
+  namespace: gloo-system
+  labels:
+    app: agentgateway
+spec:
+  gatewayClassName: agentgateway-enterprise
+  listeners:
+  - protocol: HTTP
+    port: 8080
+    name: http
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+```
+
+4. Create a `Backend` object 
+
+A Backend resource to define a backing destination that you want Gloo Gateway to route to. In this case, it's Claude.
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: Backend
+metadata:
+  labels:
+    app: agentgateway
+  name: anthropic
+  namespace: gloo-system
+spec:
+  type: AI
+  ai:
+    llm:
+        anthropic:
+          authToken:
+            kind: SecretRef
+            secretRef:
+              name: anthropic-secret
+          model: "claude-3-5-haiku-latest"
+EOF
+```
+
+5. Ensure everything is running as expected
+```
+kubectl get backend -n gloo-system
+```
+
+6. Create a rate limit rule that targets the `HTTPRoute` you just created
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: anthropic-ratelimit
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: claude
+  rateLimit:
+    local:
+      tokenBucket:
+        maxTokens: 1
+        tokensPerFill: 1
+        fillInterval: 100s
+EOF
+```
+
+7. Apply the Route so you can reach the LLM
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: claude
+  namespace: gloo-system
+  labels:
+    app: agentgateway
+spec:
+  parentRefs:
+    - name: agentgateway
+      namespace: gloo-system
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /anthropic
+    filters:
+    - type: URLRewrite
+      urlRewrite:
+        path:
+          type: ReplaceFullPath
+          replaceFullPath: /v1/chat/completions
+    backendRefs:
+    - name: anthropic
+      namespace: gloo-system
+      group: gateway.kgateway.dev
+      kind: Backend
+EOF
+```
+
+8. Capture the LB IP of the service. This will be used later to send a request to the LLM.
+```
+export INGRESS_GW_ADDRESS=$(kubectl get svc -n gloo-system agentgateway -o jsonpath="{.status.loadBalancer.ingress[0]['hostname','ip']}")
+echo $INGRESS_GW_ADDRESS
+```
+
+9. Test the LLM connectivity
+```
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v \ -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+  "model": "claude-sonnet-4-5",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a skilled cloud-native network engineer."
+    },
+    {
+      "role": "user",
+      "content": "Write me a paragraph containing the best way to think about Istio Ambient Mesh"
+    }
+  ]
+}' | jq
+```
+
+10. Run the `curl` again
+
+You'll see a `curl` error that looks something like this:
+
+```
+< x-ratelimit-limit: 1
+< x-ratelimit-remaining: 0
+< x-ratelimit-reset: 76
+< content-length: 19
+< date: Tue, 18 Nov 2025 15:35:45 GMT
+```
+
+And if you check the agentgateway Pod logs, you'll see the rate limit error.
+
+```
+kubectl logs -n gloo-system agentgateway-pod-name --tail=50 | grep -i "request\|error\|anthropic"
+```
+
+```
+2025-10-20T16:08:59.886579Z     info    request gateway=gloo-system/agentgateway listener=http route=gloo-system/claude src.addr=10.142.0.25:42187 http.method=POST http.host=34.148.15.158 http.path=/anthropic http.version=HTTP/1.1 http.status=429 error="rate limit exceeded" duration=0ms
+```
+
 ## Gateway Secure Connectivity (JWT)
 
 1. Create a traffic policy that realize on a JWT key for authentication
 ```
-kubectl apply -f- <<EOF
+kubectl delete -f- <<EOF
 apiVersion: gloo.solo.io/v1alpha1
 kind: GlooTrafficPolicy
 metadata:
@@ -203,7 +383,208 @@ You should see a failure in the `curl` output and the agentgateway Pod logs
 kubectl logs deploy/agentgateway -n gloo-system
 ```
 
-## MCP Server Security (Streamable HTTP Server)
+## MCP Server Security
+
+This section goes over two forms of MCP Security - Auth with JWT and locking down MCP Server tool lists at the gateway level
+
+### Deployment
+
+1. . Deploy the MCP Server
+```
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-website-fetcher
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: mcp-website-fetcher
+  template:
+    metadata:
+      labels:
+        app: mcp-website-fetcher
+    spec:
+      containers:
+      - name: mcp-website-fetcher
+        image: ghcr.io/peterj/mcp-website-fetcher:main
+        imagePullPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-website-fetcher
+  namespace: default
+spec:
+  selector:
+    app: mcp-website-fetcher
+  ports:
+  - port: 80
+    targetPort: 8000
+    appProtocol: kgateway.dev/mcp
+EOF
+```
+
+2. Create the Backend
+```
+kubectl apply -f - <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: Backend
+metadata:
+  name: mcp-backend
+  namespace: gloo-system
+spec:
+  type: MCP
+  mcp:
+    targets:
+    - name: mcp-target
+      static:
+        host: mcp-website-fetcher.default.svc.cluster.local
+        port: 80
+        protocol: StreamableHTTP
+        #protocol: SSE
+EOF
+```
+
+3. Create the Gateway
+```
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: agentgateway
+  namespace: gloo-system
+spec:
+  gatewayClassName: agentgateway-enterprise
+  listeners:
+  - name: http
+    port: 8080
+    protocol: HTTP
+    allowedRoutes:
+      namespaces:
+        from: Same
+EOF
+```
+
+4. Create the HTTPRoute
+```
+kubectl apply -f - <<EOF
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mcp-route
+  namespace: gloo-system
+spec:
+  parentRefs:
+  - name: agentgateway
+  rules:
+  - backendRefs:
+    - name: mcp-backend
+      group: gateway.kgateway.dev
+      kind: Backend
+EOF
+```
+
+5. Test the Gateway/route
+```
+export GATEWAY_IP=$(kubectl get svc agentgateway -n gloo-system -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo $GATEWAY_IP
+```
+
+6. Open MCP Inspector
+```
+npx modelcontextprotocol/inspector#0.16.2
+```
+
+URL to put into Inspector: `http://YOUR_ALB_LB_IP:8080/mcp`
+
+### Secure Connectivity With JWT
+
+1. Add in a traffic policy for auth based on a JWT token
+```
+kubectl apply -f- <<EOF
+apiVersion: gloo.solo.io/v1alpha1
+kind: GlooTrafficPolicy
+metadata:
+  name: jwt
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: agentgateway
+  glooJWT:
+    beforeExtAuth:
+      providers:
+        selfminted:
+          issuer: solo.io
+          jwks:
+            local:
+              key: '{"keys":[{"kty":"RSA","kid":"solo-public-key-001","use":"sig","alg":"RS256","n":"AOfIaJMUm7564sWWNHaXt_hS8H0O1Ew59-nRqruMQosfQqa7tWne5lL3m9sMAkfa3Twx0LMN_7QqRDoztvV3Wa_JwbMzb9afWE-IfKIuDqkvog6s-xGIFNhtDGBTuL8YAQYtwCF7l49SMv-GqyLe-nO9yJW-6wIGoOqImZrCxjxXFzF6mTMOBpIODFj0LUZ54QQuDcD1Nue2LMLsUvGa7V1ZHsYuGvUqzvXFBXMmMS2OzGir9ckpUhrUeHDCGFpEM4IQnu-9U8TbAJxKE5Zp8Nikefr2ISIG2Hk1K2rBAc_HwoPeWAcAWUAR5tWHAxx-UXClSZQ9TMFK850gQGenUp8","e":"AQAB"}]}'
+EOF
+```
+
+2. Save the token for "Bob"
+```
+eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InNvbG8tcHVibGljLWtleS0wMDEifQ.eyJpc3MiOiJzb2xvLmlvIiwib3JnIjoic29sby5pbyIsInN1YiI6ImJvYiIsInRlYW0iOiJvcHMiLCJleHAiOjIwNzQyNzQ5NTQsImxsbXMiOnsibWlzdHJhbGFpIjpbIm1pc3RyYWwtbGFyZ2UtbGF0ZXN0Il19fQ.GF_uyLpZSTT1DIvJeO_eish1WDjMaS4BQSifGQhqPRLjzu3nXtPkaBRjceAmJi9gKZYAzkT25MIrT42ZIe3bHilrd1yqittTPWrrM4sWDDeldnGsfU07DWJHyboNapYR-KZGImSmOYshJlzm1tT_Bjt3-RK3OBzYi90_wl0dyAl9D7wwDCzOD4MRGFpoMrws_OgVrcZQKcadvIsH8figPwN4mK1U_1mxuL08RWTu92xBcezEO4CdBaFTUbkYN66Y2vKSTyPCxg3fLtg1mvlzU1-Wgm2xZIiPiarQHt6Uq7v9ftgzwdUBQM1AYLvUVhCN6XkkR9OU3p0OXiqEDjAxcg
+```
+
+3. Try to re-connect to the MCP Server. You'll see something similar to the below:
+```
+Connection Error - Check if your MCP server is running and proxy token is correct
+```
+
+4. Click on **Authentication**
+- Header Name: **Authorization**
+- Bearer Token: Bobs Token from step 2
+
+### Lock Down Tool List
+
+1. Create a policy that specifies no tools listed
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: jwt-rbac
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.kgateway.dev
+      kind: Backend
+      name: mcp-backend
+  rbac:
+    policy:
+      matchExpressions:
+        - 'mcp.tool.name == ""'
+EOF
+```
+
+2. Disconnect and reconnect via the MCP Inspector and you should see no tools
+
+3. Update the policy to include the **Fetch** tool
+
+```
+kubectl apply -f- <<EOF
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: jwt-rbac
+  namespace: gloo-system
+spec:
+  targetRefs:
+    - group: gateway.kgateway.dev
+      kind: Backend
+      name: mcp-backend
+  rbac:
+    policy:
+      matchExpressions:
+        - 'mcp.tool.name == "fetch"'
+EOF
+```
+
+## MCP Server Security For Streamable HTTP Server
 
 The config below works very much like a package/library import in application code.
 
@@ -536,184 +917,4 @@ kubectl logs deploy/agentgateway -n gloo-system
 3. Look at the logs for the OTel tracing collector and you'll be able to see the trace ID
 ```
 kubectl logs deploy/opentelemetry-collector-traces -n telemetry
-```
-
-## Bonus: Rate Limiting
-
-1. Create env variable for Anthropic key
-
-```
-export ANTHROPIC_API_KEY=
-```
-
-2. Create a secret to store the Claude API key
-```
-kubectl apply -f- <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: anthropic-secret
-  namespace: kgateway-system
-  labels:
-    app: agentgateway
-type: Opaque
-stringData:
-  Authorization: $ANTHROPIC_API_KEY
-EOF
-```
-
-3. Create a Gateway for Anthropic
-
-A `Gateway` resource is used to trigger kgateway to deploy agentgateway data plane Pods
-
-The Agentgateway data plane Pod is the Pod that gets created when a Gateway object is created in a Kubernetes environment where Agentgateway is deployed as the Gateway API implementation.
-```
-kubectl apply -f- <<EOF
-kind: Gateway
-apiVersion: gateway.networking.k8s.io/v1
-metadata:
-  name: agentgateway
-  namespace: gloo-system
-  labels:
-    app: agentgateway
-spec:
-  gatewayClassName: agentgateway-enterprise
-  listeners:
-  - protocol: HTTP
-    port: 8080
-    name: http
-    allowedRoutes:
-      namespaces:
-        from: All
-EOF
-```
-
-4. Create a `Backend` object 
-
-A Backend resource to define a backing destination that you want Gloo Gateway to route to. In this case, it's Claude.
-```
-kubectl apply -f- <<EOF
-apiVersion: gateway.kgateway.dev/v1alpha1
-kind: Backend
-metadata:
-  labels:
-    app: agentgateway
-  name: anthropic
-  namespace: gloo-system
-spec:
-  type: AI
-  ai:
-    llm:
-        anthropic:
-          authToken:
-            kind: SecretRef
-            secretRef:
-              name: anthropic-secret
-          model: "claude-3-5-haiku-latest"
-EOF
-```
-
-5. Ensure everything is running as expected
-```
-kubectl get backend -n gloo-system
-```
-
-6. Create a rate limit rule that targets the `HTTPRoute` you just created
-```
-kubectl apply -f- <<EOF
-apiVersion: gateway.kgateway.dev/v1alpha1
-kind: TrafficPolicy
-metadata:
-  name: anthropic-ratelimit
-  namespace: gloo-system
-spec:
-  targetRefs:
-    - group: gateway.networking.k8s.io
-      kind: HTTPRoute
-      name: claude
-  rateLimit:
-    local:
-      tokenBucket:
-        maxTokens: 1
-        tokensPerFill: 1
-        fillInterval: 100s
-EOF
-```
-
-7. Apply the Route so you can reach the LLM
-```
-kubectl apply -f- <<EOF
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: claude
-  namespace: gloo-system
-  labels:
-    app: agentgateway
-spec:
-  parentRefs:
-    - name: agentgateway
-      namespace: gloo-system
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /anthropic
-    filters:
-    - type: URLRewrite
-      urlRewrite:
-        path:
-          type: ReplaceFullPath
-          replaceFullPath: /v1/chat/completions
-    backendRefs:
-    - name: anthropic
-      namespace: gloo-system
-      group: gateway.kgateway.dev
-      kind: Backend
-EOF
-```
-
-8. Capture the LB IP of the service. This will be used later to send a request to the LLM.
-```
-export INGRESS_GW_ADDRESS=$(kubectl get svc -n gloo-system agentgateway -o jsonpath="{.status.loadBalancer.ingress[0]['hostname','ip']}")
-echo $INGRESS_GW_ADDRESS
-```
-
-9. Test the LLM connectivity
-```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v \ -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
-  "model": "claude-sonnet-4-5",
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a skilled cloud-native network engineer."
-    },
-    {
-      "role": "user",
-      "content": "Write me a paragraph containing the best way to think about Istio Ambient Mesh"
-    }
-  ]
-}' | jq
-```
-
-10. Run the `curl` again
-
-You'll see a `curl` error that looks something like this:
-
-```
-< x-ratelimit-limit: 1
-< x-ratelimit-remaining: 0
-< x-ratelimit-reset: 76
-< content-length: 19
-< date: Tue, 18 Nov 2025 15:35:45 GMT
-```
-
-And if you check the agentgateway Pod logs, you'll see the rate limit error.
-
-```
-kubectl logs -n gloo-system agentgateway-pod-name --tail=50 | grep -i "request\|error\|anthropic"
-```
-
-```
-2025-10-20T16:08:59.886579Z     info    request gateway=gloo-system/agentgateway listener=http route=gloo-system/claude src.addr=10.142.0.25:42187 http.method=POST http.host=34.148.15.158 http.path=/anthropic http.version=HTTP/1.1 http.status=429 error="rate limit exceeded" duration=0ms
 ```
