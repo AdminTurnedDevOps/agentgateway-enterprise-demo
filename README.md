@@ -1,3 +1,19 @@
+# Agentgateway Enterprise Demo
+
+There are two teams thinking about AI on the majority of projects:
+
+- Platform/DevOps Engineering
+- AI-specific teams
+
+The Platform/DevOps teams are thinking about security, resiliency, governance, and observability.
+
+The AI teams are thinking about LLM/Model selection, MCP Server tool integration, and an understanding of how LLMs are performing for Agentic and training purposes.
+
+This means that both teams are thinking about:
+- Securing access to MCP Servers/tools along with implementing MCP Servers/tools
+- Performance to LLMs/Models and ensuring that the traffic going to LLMs is the right traffic from the right people and Agents (rate limiting)
+- End-to-end observability for LLM connection, MCP Server connection, and the overall packets to and from LLMs/Agents/MCP Servers. This is important for both teams as AI teams need good performance along with accurate results from Agents/LLMs/MCP Servers and Platform/DevOps teams need to ensure that the gateways to handle the traffic are working as expected and are secure.
+
 ## Gloo Gateway + Agentgateway Installation
 
 1. Export the Gloo Gateway license key and agentgateway license key
