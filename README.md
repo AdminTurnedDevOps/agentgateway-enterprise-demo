@@ -186,7 +186,7 @@ apiVersion: v1
 kind: Secret
 metadata:
   name: anthropic-secret
-  namespace: kgateway-system
+  namespace: gloo-system
   labels:
     app: agentgateway
 type: Opaque
