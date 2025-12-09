@@ -47,7 +47,7 @@ helm upgrade -i -n gloo-system gloo-gateway oci://us-docker.pkg.dev/solo-public/
 
 1. Export your Anthropic API key
 ```
-export ANTHROPIC_API_KEY=
+export ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ```
 
 2. Create a Gateway using the agentgateway enterprise gatewayclass to ensure the proper data plane/proxy is configured for AI traffic
@@ -157,7 +157,7 @@ EOF
 
 8. Test the Model connectivity
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H "anthropic-version: 2023-06-01" -d '{
   "messages": [
     {
       "role": "system",
@@ -172,6 +172,8 @@ curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-
 ```
 
 ## Rate Limiting
+
+You only need to create the Secret for the Anthropic key, Gateway, Backend, and HTTPRoute if you didn't follow the **Set Up A Gateway For Testing** section.
 
 1. Create env variable for Anthropic key
 
@@ -314,7 +316,7 @@ echo $INGRESS_GW_ADDRESS
 
 9. Test the LLM connectivity
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v \ -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v \ -H content-type:application/json -H "anthropic-version: 2023-06-01" -d '{
   "model": "claude-sonnet-4-5",
   "messages": [
     {
@@ -355,7 +357,7 @@ kubectl logs -n gloo-system agentgateway-pod-name --tail=50 | grep -i "request\|
 
 1. Create a traffic policy that realize on a JWT key for authentication
 ```
-kubectl delete -f- <<EOF
+kubectl apply -f- <<EOF
 apiVersion: gloo.solo.io/v1alpha1
 kind: GlooTrafficPolicy
 metadata:
@@ -379,7 +381,7 @@ EOF
 
 2. Try curling the Gateway
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -v -H content-type:application/json -H "anthropic-version: 2023-06-01" -d '{
   "messages": [
     {
       "role": "system",
@@ -775,7 +777,7 @@ To log into the Grafana UI:
 
 4. Generate some LLM traffic
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H "anthropic-version: 2023-06-01" -d '{
   "messages": [
     {
       "role": "system",
@@ -907,7 +909,7 @@ EOF
 
 1. Generate traffic
 ```
-curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H x-api-key:$ANTHROPIC_API_KEY -H "anthropic-version: 2023-06-01" -d '{
+curl "$INGRESS_GW_ADDRESS:8080/anthropic" -H content-type:application/json -H "anthropic-version: 2023-06-01" -d '{
   "messages": [
     {
       "role": "system",
